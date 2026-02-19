@@ -904,6 +904,39 @@ NOBDEF Nob_String_View nob_sv_from_parts(const char *data, size_t count);
 //   String_View name = ...;
 //   printf("Name: "SV_Fmt"\n", SV_Arg(name));
 
+// Compilation Database for compile_commands.json (LSP support)
+// See https://clang.llvm.org/docs/JSONCompilationDatabase.html
+
+// Single entry in compilation database
+typedef struct {
+    const char *directory;   // Working directory (required, should be absolute path)
+    const char *file;        // Source file (required)
+    Nob_Cmd arguments;       // Compiler arguments (required)
+    const char *output;      // Output file (optional, can be NULL)
+} Nob_Compdb_Entry;
+
+// Dynamic array of compilation database entries
+typedef struct {
+    Nob_Compdb_Entry *items;
+    size_t count;
+    size_t capacity;
+} Nob_Compdb;
+
+// Options for nob_compdb_add_opt()
+typedef struct {
+    const char *directory;   // Working directory (default: current directory)
+    const char *output;      // Output file (default: NULL)
+} Nob_Compdb_Add_Opt;
+
+// Add entry to compilation database with options
+NOBDEF bool nob_compdb_add_opt(Nob_Compdb *db, Nob_Cmd *cmd, const char *file, Nob_Compdb_Add_Opt opt);
+// Convenience macro for nob_compdb_add_opt() with named parameters
+#define nob_compdb_add(db, cmd, file, ...) nob_compdb_add_opt((db), (cmd), (file), (Nob_Compdb_Add_Opt){__VA_ARGS__})
+// Save compilation database to JSON file
+NOBDEF bool nob_compdb_save(Nob_Compdb *db, const char *path);
+// Free memory allocated by compilation database
+NOBDEF void nob_compdb_free(Nob_Compdb *db);
+
 #ifdef _WIN32
 
 NOBDEF char *nob_win32_error_message(DWORD err);
@@ -2749,6 +2782,166 @@ NOBDEF char *nob_temp_running_executable_path(void)
 #endif
 }
 
+// Append a JSON-escaped string to a string builder
+// Escapes: " \ / \b \f \n \r \t and control characters
+static void nob__sb_append_json_string(Nob_String_Builder *sb, const char *str)
+{
+    if (str == NULL) {
+        nob_sb_append_cstr(sb, "null");
+        return;
+    }
+    
+    nob_da_append(sb, '"');
+    
+    for (const char *p = str; *p != '\0'; p++) {
+        switch (*p) {
+            case '"':  nob_sb_append_cstr(sb, "\\\""); break;
+            case '\\': nob_sb_append_cstr(sb, "\\\\"); break;
+            case '\b': nob_sb_append_cstr(sb, "\\b");  break;
+            case '\f': nob_sb_append_cstr(sb, "\\f");  break;
+            case '\n': nob_sb_append_cstr(sb, "\\n");  break;
+            case '\r': nob_sb_append_cstr(sb, "\\r");  break;
+            case '\t': nob_sb_append_cstr(sb, "\\t");  break;
+            default:
+                if ((unsigned char)*p < 0x20) {
+                    // Control character - escape as \uXXXX
+                    nob_sb_appendf(sb, "\\u%04x", (unsigned char)*p);
+                } else {
+                    nob_da_append(sb, *p);
+                }
+                break;
+        }
+    }
+    
+    nob_da_append(sb, '"');
+}
+
+NOBDEF bool nob_compdb_add_opt(Nob_Compdb *db, Nob_Cmd *cmd, const char *file, Nob_Compdb_Add_Opt opt)
+{
+    if (db == NULL || cmd == NULL || file == NULL) {
+        nob_log(NOB_ERROR, "nob_compdb_add_opt: invalid arguments (NULL pointer)");
+        return false;
+    }
+    
+    Nob_Compdb_Entry entry = {0};
+    
+    // Set directory (default: current directory)
+    if (opt.directory != NULL) {
+        entry.directory = nob_temp_strdup(opt.directory);
+    } else {
+        entry.directory = nob_get_current_dir_temp();
+        if (entry.directory == NULL) return false;
+    }
+    
+    // Set file path
+    entry.file = nob_temp_strdup(file);
+    if (entry.file == NULL) return false;
+    
+    // Copy command arguments
+    for (size_t i = 0; i < cmd->count; ++i) {
+        const char *arg = nob_temp_strdup(cmd->items[i]);
+        if (arg == NULL) return false;
+        nob_da_append(&entry.arguments, arg);
+    }
+    
+    // Set output (optional)
+    if (opt.output != NULL) {
+        entry.output = nob_temp_strdup(opt.output);
+        if (entry.output == NULL) return false;
+    } else {
+        entry.output = NULL;
+    }
+    
+    nob_da_append(db, entry);
+    return true;
+}
+
+NOBDEF bool nob_compdb_save(Nob_Compdb *db, const char *path)
+{
+    if (db == NULL || path == NULL) {
+        nob_log(NOB_ERROR, "nob_compdb_save: invalid arguments (NULL pointer)");
+        return false;
+    }
+    
+    bool result = true;
+    Nob_String_Builder sb = {0};
+    
+    nob_da_append(&sb, '[');
+    
+    for (size_t i = 0; i < db->count; ++i) {
+        Nob_Compdb_Entry *entry = &db->items[i];
+        
+        if (i > 0) {
+            nob_sb_append_cstr(&sb, ",");
+        }
+        nob_sb_append_cstr(&sb, "\n  {");
+        
+        // directory (required)
+        nob_sb_append_cstr(&sb, "\n    \"directory\": ");
+        nob__sb_append_json_string(&sb, entry->directory);
+        nob_sb_append_cstr(&sb, ",");
+        
+        // file (required)
+        nob_sb_append_cstr(&sb, "\n    \"file\": ");
+        nob__sb_append_json_string(&sb, entry->file);
+        nob_sb_append_cstr(&sb, ",");
+        
+        // arguments (required)
+        nob_sb_append_cstr(&sb, "\n    \"arguments\": [");
+        for (size_t j = 0; j < entry->arguments.count; ++j) {
+            if (j > 0) nob_sb_append_cstr(&sb, ",");
+            nob_sb_append_cstr(&sb, "\n      ");
+            nob__sb_append_json_string(&sb, entry->arguments.items[j]);
+        }
+        nob_sb_append_cstr(&sb, "\n    ]");
+        
+        // output (optional)
+        if (entry->output != NULL) {
+            nob_sb_append_cstr(&sb, ",\n    \"output\": ");
+            nob__sb_append_json_string(&sb, entry->output);
+        }
+        
+        nob_sb_append_cstr(&sb, "\n  }");
+    }
+    
+    nob_sb_append_cstr(&sb, "\n]\n");
+    nob_sb_append_null(&sb);
+    
+    if (!nob_write_entire_file(path, sb.items, sb.count - 1)) {  // -1 to exclude null terminator
+        nob_return_defer(false);
+    }
+    
+#ifndef NOB_NO_ECHO
+    nob_log(NOB_INFO, "saved compilation database to %s", path);
+#endif // NOB_NO_ECHO
+    
+defer:
+    nob_sb_free(sb);
+    return result;
+}
+
+NOBDEF void nob_compdb_free(Nob_Compdb *db)
+{
+    if (db == NULL) return;
+    
+    for (size_t i = 0; i < db->count; ++i) {
+        Nob_Compdb_Entry *entry = &db->items[i];
+        // Note: directory, file, output are allocated in temp storage, no need to free
+        // Free the arguments array
+        if (entry->arguments.items != NULL) {
+            NOB_FREE(entry->arguments.items);
+        }
+    }
+    
+    if (db->items != NULL) {
+        NOB_FREE(db->items);
+    }
+    
+    db->items = NULL;
+    db->count = 0;
+    db->capacity = 0;
+}
+
 #endif // NOB_IMPLEMENTATION
 
 #ifndef NOB_STRIP_PREFIX_GUARD_
@@ -2908,6 +3101,13 @@ NOBDEF char *nob_temp_running_executable_path(void)
         #define nprocs nob_nprocs
         #define nanos_since_unspecified_epoch nob_nanos_since_unspecified_epoch
         #define NANOS_PER_SEC NOB_NANOS_PER_SEC
+        #define Compdb_Entry Nob_Compdb_Entry
+        #define Compdb Nob_Compdb
+        #define Compdb_Add_Opt Nob_Compdb_Add_Opt
+        #define compdb_add nob_compdb_add
+        #define compdb_add_opt nob_compdb_add_opt
+        #define compdb_save nob_compdb_save
+        #define compdb_free nob_compdb_free
     #endif // NOB_STRIP_PREFIX
 #endif // NOB_STRIP_PREFIX_GUARD_
 
